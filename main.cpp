@@ -34,7 +34,7 @@ std::string path_to_string(const fs::path& p) { return p.string(); }
 int main(int argc, char* argv[]) {
     cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_SILENT);
 
-    fs::path image_folder = fs::path("C:\\Users\\madsm\\source\\repos\\visual_computing_nilsson\\images");
+    fs::path image_folder = fs::path("../../images");
     std::string image_left_name, image_right_name, detector_name;
     double scale;
     bool use_ratio_test;
@@ -99,6 +99,8 @@ int main(int argc, char* argv[]) {
 
     if (img1.empty() || img2.empty()) {
         std::cerr << "Failed to load one or both images." << std::endl;
+        std::cerr << "Left image path:  " << fs::absolute(left_path) << " (exists: " << fs::exists(left_path) << ")" << std::endl;
+        std::cerr << "Right image path: " << fs::absolute(right_path) << " (exists: " << fs::exists(right_path) << ")" << std::endl;
         return 1;
     }
 
@@ -127,8 +129,10 @@ int main(int argc, char* argv[]) {
         << " img2=" << kpts2.size() << "\n";
 
     // Match descriptors
+    std::cout << "Matching descriptors..." << std::endl;
     std::vector<std::vector<cv::DMatch>> knn_matches;
     matcher->knnMatch(desc1, desc2, knn_matches, 2);
+    std::cout << "Found " << knn_matches.size() << " knn matches." << std::endl;
 
     std::vector<cv::DMatch> good_matches;
     if (use_ratio_test) {
@@ -144,8 +148,10 @@ int main(int argc, char* argv[]) {
     if (good_matches.size() < 4) {
         std::cerr << "Not enough matches.\n"; return 1;
     }
+    std::cout << "Good matches after ratio test: " << good_matches.size() << "\n";
 
     // Compute homography
+    std::cout << "Computing homography..." << std::endl;
     std::vector<cv::Point2f> pts1, pts2;
     for (const auto& m : good_matches) {
         pts1.push_back(kpts1[m.queryIdx].pt);
@@ -154,6 +160,60 @@ int main(int argc, char* argv[]) {
 
     std::vector<unsigned char> inliers_mask;
     cv::Mat H = cv::findHomography(pts2, pts1, cv::RANSAC, ransac_reproj_thresh, inliers_mask);
+    
+    // Count inliers
+    int num_inliers = 0;
+    for (auto m : inliers_mask) {
+        if (m) num_inliers++;
+    }
+    std::cout << "RANSAC inliers: " << num_inliers << " / " << good_matches.size() << std::endl;
+    std::cout << "Homography computed. Warping images..." << std::endl;
+
+    // Create feature matching visualization with statistics
+    std::vector<char> inliers_char(inliers_mask.begin(), inliers_mask.end());
+    cv::Mat match_img;
+    cv::drawMatches(img1, kpts1, img2, kpts2, good_matches, match_img, 
+                    cv::Scalar::all(-1), cv::Scalar::all(-1), 
+                    inliers_char, cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
+    
+    // Create statistics overlay
+    int text_height = 30;
+    int stats_height = 250;
+    cv::Mat stats_img(stats_height + match_img.rows, match_img.cols, CV_8UC3, cv::Scalar(40, 40, 40));
+    match_img.copyTo(stats_img(cv::Rect(0, stats_height, match_img.cols, match_img.rows)));
+    
+    // Add text statistics
+    int y_offset = 35;
+    cv::putText(stats_img, "PANORAMA STITCHING STATISTICS", cv::Point(20, y_offset), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2);
+    y_offset += 40;
+    
+    cv::putText(stats_img, "Detector: " + detector_name, cv::Point(20, y_offset), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(100, 255, 100), 1);
+    y_offset += 30;
+    
+    cv::putText(stats_img, "Left Image: " + image_left_name + "  |  Right Image: " + image_right_name, 
+                cv::Point(20, y_offset), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(200, 200, 200), 1);
+    y_offset += 30;
+    
+    cv::putText(stats_img, "Keypoints - Left: " + std::to_string(kpts1.size()) + 
+                "  |  Right: " + std::to_string(kpts2.size()), 
+                cv::Point(20, y_offset), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 200, 100), 1);
+    y_offset += 30;
+    
+    cv::putText(stats_img, "Matches: " + std::to_string(knn_matches.size()) + 
+                "  |  Good Matches (ratio=" + std::to_string(ratio_thresh) + "): " + std::to_string(good_matches.size()), 
+                cv::Point(20, y_offset), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 200, 100), 1);
+    y_offset += 30;
+    
+    cv::putText(stats_img, "RANSAC Inliers: " + std::to_string(num_inliers) + 
+                " (" + std::to_string((int)(100.0 * num_inliers / good_matches.size())) + "%)" +
+                "  |  Threshold: " + std::to_string(ransac_reproj_thresh) + "px", 
+                cv::Point(20, y_offset), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(100, 255, 255), 1);
+    y_offset += 30;
+    
+    cv::putText(stats_img, "Scale: " + std::to_string(scale), 
+                cv::Point(20, y_offset), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(200, 200, 200), 1);
 
     // Warp images
     std::vector<cv::Point2f> corners2 = { {0,0}, {(float)img2.cols,0}, {(float)img2.cols,(float)img2.rows}, {0,(float)img2.rows} };
@@ -207,24 +267,31 @@ int main(int argc, char* argv[]) {
         masks_um.push_back(mu);
     }
 
-    // Seam finder (GraphCut with fallback)
+    // Seam finder (Voronoi only)
+    std::cout << "Finding seams (this may take a while)..." << std::endl;
     try {
-        cv::Ptr<cv::detail::SeamFinder> seam_finder = cv::makePtr<cv::detail::GraphCutSeamFinder>(
-            cv::detail::GraphCutSeamFinderBase::COST_COLOR);
-        seam_finder->find(imgs_um, corners, masks_um);
-    }
-    catch (cv::Exception&) {
-        std::cerr << "GraphCut failed, using VoronoiSeamFinder as fallback.\n";
         cv::Ptr<cv::detail::SeamFinder> seam_finder = cv::makePtr<cv::detail::VoronoiSeamFinder>();
         seam_finder->find(imgs_um, corners, masks_um);
+        std::cout << "Seam finding completed successfully." << std::endl;
+    }
+    catch (cv::Exception& e) {
+        std::cerr << "Voronoi failed: " << e.what() << "\nSkipping seam finding.\n";
+    }
+    catch (std::exception& e) {
+        std::cerr << "Seam finding failed with error: " << e.what() << "\nSkipping seam finding.\n";
+    }
+    catch (...) {
+        std::cerr << "Seam finding failed with unknown error. Skipping seam finding.\n";
     }
 
     // Copy masks back
+    std::cout << "Copying masks back..." << std::endl;
     for (size_t i = 0; i < masks.size(); ++i) {
         masks_um[i].copyTo(masks[i]);
     }
 
     // Multi-band blending
+    std::cout << "Blending images..." << std::endl;
     cv::detail::MultiBandBlender blender;
     blender.prepare(cv::Rect(0, 0, pano_w, pano_h));
     for (size_t i = 0; i < imgs.size(); ++i) {
@@ -250,12 +317,29 @@ int main(int argc, char* argv[]) {
         counter++;
     }
 
+    std::cout << "Attempting to save to: " << fs::absolute(outpath) << "\n";
+    std::cout << "Directory exists: " << fs::exists(stored_folder) << "\n";
+    
     if (cv::imwrite(path_to_string(outpath), result))
-        std::cout << "Saved panorama at: " << outpath << "\n";
+        std::cout << "Saved panorama at: " << fs::absolute(outpath) << "\n";
     else
-        std::cerr << "Failed to save panorama.\n";
+        std::cerr << "Failed to save panorama at: " << fs::absolute(outpath) << "\n";
+
+    // Save statistics image
+    fs::path stats_path = stored_folder / (base_outname + "_stats.png");
+    counter = 1;
+    while (fs::exists(stats_path)) {
+        stats_path = stored_folder / (base_outname + "_stats_" + std::to_string(counter) + ".png");
+        counter++;
+    }
+    
+    if (cv::imwrite(path_to_string(stats_path), stats_img))
+        std::cout << "Saved statistics image at: " << fs::absolute(stats_path) << "\n";
+    else
+        std::cerr << "Failed to save statistics image at: " << fs::absolute(stats_path) << "\n";
 
     cv::imshow("Panorama", result);
+    cv::imshow("Statistics & Feature Matching", stats_img);
     cv::waitKey(0);
     cv::destroyAllWindows();
     return 0;
